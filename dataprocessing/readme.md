@@ -29,7 +29,7 @@ python scripts/split.py \
 
 ---
 
-## Sensitive Relations
+## Target Relations
 
 ### Attack1 (Link Inference)
 
@@ -68,3 +68,11 @@ concept:subpartof,
 concept:teamplaysagainstteam
 \```
 
+## Utility (Link Predicition)
+For utility evaluation, we performed link prediction tasks on both the original public knowledge graphs and the defended graphs, focusing on specific relation types. An 80/20 split was used for training and testing.
+
+- **NELL**: `concept:athleteplayssport`  
+- **HealthKG**: `has_age_category`  
+- **FB15K**: `/people/person/nationality`  
+
+All results are reproducible by running the `utility` script located in the `experiments` folder.
