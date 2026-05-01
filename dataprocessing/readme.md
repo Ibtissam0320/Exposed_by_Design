@@ -43,29 +43,28 @@ python scripts/split.py \
 
 **FB15k-237:**
 \```
-education__educational_institution__students_graduates.__education__education__student
-film__film__genre
-people__person__profession
+education__educational_institution__students_graduates.__education__education__student,
+film__film__genre,
+people__person__profession,
 sports__sports_position__players.__sports__sports_team_roster__team
 \```
 
 **HealthKG:**
 \```
-has_age_category
-has_age_living_apart
-has_family_ID
-has_gender
-has_is_westernized
-has_is-from
+has_age_category,
+has_age_living_apart,
+has_family_ID,
+has_gender,
+has_is_westernized,
+has_is-from,
 has_zygosity
 \```
 
 **NELL:**
 \```
-concept:atlocation
-concept:proxyfor
-concept:subpartof
+concept:atlocation,
+concept:proxyfor,
+concept:subpartof,
 concept:teamplaysagainstteam
 \```
 
-> **Note:** HealthKG's public file includes a header row. Use the `--public-has-header` flag in the attack scripts for this dataset.
