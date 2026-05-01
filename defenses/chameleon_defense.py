@@ -2,12 +2,10 @@
 CHAMELEON — Dynamic Defense
 =========================================================
 Detects the structural profile of sensitive nodes once,
-then selects the appropriate defense for all budgets:
-
-
+then selects the appropriate defense for all budgets.
 
 Usage:
-  python dynamic_defense.py \\
+  python chameleon_defense.py \\
     --public-path  /path/to/global_kg_public.tsv \\
     --sens-dir     /path/to/sensitive/ \\
     --outdir       /path/to/output/ \\
@@ -16,7 +14,6 @@ Usage:
 """
 
 import os
-import sys
 import random
 import argparse
 import numpy as np
@@ -24,12 +21,12 @@ import pandas as pd
 import networkx as nx
 from collections import defaultdict, Counter
 
+
 # ─────────────────────────────────────────────────────────────────
-# 1. LOAD DATA
+# 1. LOAD / SAVE
 # ─────────────────────────────────────────────────────────────────
 
 def load_graph_nx(path):
-    """Load as NetworkX MultiDiGraph (used by TFE)."""
     df = pd.read_csv(path, sep='\t', header=None,
                      names=['h', 'r', 't'], dtype=str).dropna()
     G = nx.MultiDiGraph()
@@ -38,18 +35,19 @@ def load_graph_nx(path):
     return G
 
 
-def load_graph_prism(path):
-    """Load as undirected Graph with relation lists (used by PRISM kg_defense_v2 style)."""
+def load_graph_undirected(path):
     df = pd.read_csv(path, sep='\t', header=None,
-                     names=['h', 'r', 't'], dtype=str).dropna()
-    G = nx.Graph()
+                     names=['h', 'r', 't'], dtype=str,
+                     low_memory=False).dropna()
+    df = df.map(str.strip)
+    G  = nx.Graph()
     for _, row in df.iterrows():
         u, r, v = row['h'], row['r'], row['t']
         if G.has_edge(u, v):
             G[u][v]['relations'].append(r)
         else:
             G.add_edge(u, v, relations=[r])
-    return G, df
+    return G, df['r'].unique().tolist()
 
 
 def load_all_sensitive_heads(sens_dir):
@@ -75,7 +73,7 @@ def save_graph_nx(G, path):
     print(f"  [Save] {len(rows):,} triples → {path}")
 
 
-def save_graph_prism(G, path):
+def save_graph_undirected(G, path):
     rows = []
     for u, v, data in G.edges(data=True):
         for r in data.get('relations', ['unknown']):
@@ -83,18 +81,17 @@ def save_graph_prism(G, path):
     pd.DataFrame(rows).to_csv(path, sep='\t', index=False, header=False)
     print(f"  [Save] {len(rows):,} triples → {path}")
 
+
 # ─────────────────────────────────────────────────────────────────
 # 2. PROFILE DETECTION
 # ─────────────────────────────────────────────────────────────────
 
 def detect_profile(G_nx, sensitive_heads):
     """
-    Compute μ_S vs μ_NS for all 4 structural features.
-    A feature is INVERTED if μ_S < μ_NS.
-
+    Compute μ_S vs μ_NS for 4 structural features.
     Decision rule:
-      strictly more than 2 features inverted (>2/4) → TFE v2
-      otherwise                                      → PRISM
+      > 2 features where μ_S > 2·μ_NS  →  dense branch
+      otherwise                         →  sparse branch
     """
     s_nodes  = [n for n in sensitive_heads
                 if n in G_nx.nodes() and G_nx.out_degree(n) > 0]
@@ -102,7 +99,7 @@ def detect_profile(G_nx, sensitive_heads):
                 if n not in sensitive_heads and G_nx.out_degree(n) > 0]
 
     if not s_nodes or not ns_nodes:
-        print("  [Profile] Not enough nodes — defaulting to PRISM")
+        print("  [Profile] Not enough nodes — defaulting to sparse branch")
         return 'normal'
 
     def feat_stats(nodes):
@@ -133,7 +130,8 @@ def detect_profile(G_nx, sensitive_heads):
 
     n_inverted = 0
     for feat in ['out_deg', 'in_deg', 'rel_div', 'avg_nb_deg']:
-        inv = (s_med[feat] > ns_med[feat]) and (s_med[feat] / max(ns_med[feat], 0.01) > 2.0)
+        inv = (s_med[feat] > ns_med[feat]) and \
+              (s_med[feat] / max(ns_med[feat], 0.01) > 2.0)
         if inv:
             n_inverted += 1
         print(f"  {feat:<15} {s_med[feat]:>8.2f} {ns_med[feat]:>8.2f} "
@@ -142,50 +140,36 @@ def detect_profile(G_nx, sensitive_heads):
     print(f"\n  Inverted features : {n_inverted}/4")
 
     if n_inverted > 2:
-        print(f"  → INVERTED profile (>{2}/4) → TFE v2")
+        print(f"  → Dense profile detected → equalization branch")
         return 'inverted'
     else:
-        print(f"  → NORMAL profile (≤2/4 inverted) → PRISM")
+        print(f"  → Sparse profile detected → disruption branch")
         return 'normal'
 
-# ─────────────────────────────────────────────────────────────────
-# 3. PRISM — kg_defense_v2 (exact, inlined)
-# ─────────────────────────────────────────────────────────────────
 
-def _load_kg_prism(path):
-    df = pd.read_csv(path, sep="\t", header=None,
-                     names=["h", "r", "t"], dtype=str,
-                     low_memory=False).dropna()
-    df = df.map(str.strip)
-    G  = nx.Graph()
-    for _, row in df.iterrows():
-        u, r, v = row["h"], row["r"], row["t"]
-        if G.has_edge(u, v):
-            G[u][v]["relations"].append(r)
-        else:
-            G.add_edge(u, v, relations=[r])
-    return G, df["r"].unique().tolist()
-
+# ─────────────────────────────────────────────────────────────────
+# 3. SPARSE BRANCH (structural disruption)
+# ─────────────────────────────────────────────────────────────────
 
 def _compute_risk_scores(G):
-    edges = list(G.edges())
-    deg   = dict(G.degree())
-    clust = nx.clustering(G)
+    edges     = list(G.edges())
+    deg       = dict(G.degree())
+    clust     = nx.clustering(G)
     deg_count = Counter(deg.values())
     k_anon    = {n: deg_count[deg[n]] for n in G.nodes()}
     max_k     = max(k_anon.values())
     max_dp    = max(deg[u] * deg[v] for u, v in edges) or 1
-    risk     = {}
-    cn_cache = {}
+    risk      = {}
+    cn_cache  = {}
     for u, v in edges:
-        cn = len(list(nx.common_neighbors(G, u, v)))
+        cn            = len(list(nx.common_neighbors(G, u, v)))
         cn_cache[(u, v)] = cn
-        cn_norm   = cn / max(1, min(deg[u], deg[v]))
-        kanon_r   = 1.0 - min(k_anon[u], k_anon[v]) / max_k
-        bet_proxy = (deg[u] * deg[v]) / max_dp
-        clust_avg = (clust[u] + clust[v]) / 2.0
-        risk[(u, v)] = (0.30 * cn_norm + 0.25 * kanon_r +
-                        0.25 * bet_proxy + 0.20 * clust_avg)
+        cn_norm       = cn / max(1, min(deg[u], deg[v]))
+        kanon_r       = 1.0 - min(k_anon[u], k_anon[v]) / max_k
+        bet_proxy     = (deg[u] * deg[v]) / max_dp
+        clust_avg     = (clust[u] + clust[v]) / 2.0
+        risk[(u, v)]  = (0.30 * cn_norm + 0.25 * kanon_r +
+                         0.25 * bet_proxy + 0.20 * clust_avg)
     sorted_edges = sorted(risk.items(), key=lambda x: x[1], reverse=True)
     return sorted_edges, cn_cache
 
@@ -193,7 +177,7 @@ def _compute_risk_scores(G):
 def _triangle_disruption_delete(G, n_delete, cn_cache):
     edges_by_cn = sorted(cn_cache.items(), key=lambda x: x[1], reverse=True)
     deleted = 0
-    for (u, v), cn in edges_by_cn:
+    for (u, v), _ in edges_by_cn:
         if deleted >= n_delete:
             break
         if G.has_edge(u, v):
@@ -208,11 +192,11 @@ def _add_plausible_fake_edges(G, n_add, all_relations):
     attempts = 0
     while added < n_add and attempts < n_add * 50:
         attempts += 1
-        u = random.choice(nodes)
+        u     = random.choice(nodes)
         nbs_u = list(G.neighbors(u))
         if not nbs_u:
             continue
-        w = random.choice(nbs_u)
+        w     = random.choice(nbs_u)
         nbs_w = list(G.neighbors(w))
         if not nbs_w:
             continue
@@ -229,22 +213,22 @@ def _add_plausible_fake_edges(G, n_add, all_relations):
 def _obfuscate_node_relation_profiles(G, budget_fraction=0.15):
     node_rel = defaultdict(Counter)
     for u, v, data in G.edges(data=True):
-        for r in data.get("relations", []):
+        for r in data.get('relations', []):
             node_rel[u][r] += 1
             node_rel[v][r] += 1
-    sigs      = {n: frozenset(p.keys()) for n, p in node_rel.items()}
-    sig_count = Counter(sigs.values())
+    sigs       = {n: frozenset(p.keys()) for n, p in node_rel.items()}
+    sig_count  = Counter(sigs.values())
     uniqueness = {n: 1.0 / sig_count[s] for n, s in sigs.items()}
     sorted_nodes = sorted(uniqueness, key=uniqueness.get, reverse=True)
     target_nodes = set(sorted_nodes[:int(len(sorted_nodes) * budget_fraction)])
     all_relations = list(set(r for _, _, d in G.edges(data=True)
-                             for r in d.get("relations", [])))
+                             for r in d.get('relations', [])))
     for u, v, data in G.edges(data=True):
-        if (u in target_nodes or v in target_nodes) and data.get("relations"):
+        if (u in target_nodes or v in target_nodes) and data.get('relations'):
             if random.random() < 0.3:
-                rels = data["relations"][:]
-                rels[random.randint(0, len(rels)-1)] = random.choice(all_relations)
-                G[u][v]["relations"] = rels
+                rels      = data['relations'][:]
+                rels[random.randint(0, len(rels) - 1)] = random.choice(all_relations)
+                G[u][v]['relations'] = rels
     return G
 
 
@@ -256,7 +240,7 @@ def _rewire_edges(G, sorted_edges, n_rewire):
         if rewired >= n_rewire:
             break
         if G.has_edge(u, v):
-            rels  = G[u][v]["relations"][:]
+            rels  = G[u][v]['relations'][:]
             new_v = random.choice(nodes)
             if new_v != u and not G.has_edge(u, new_v):
                 G.remove_edge(u, v)
@@ -265,67 +249,43 @@ def _rewire_edges(G, sorted_edges, n_rewire):
     return G
 
 
-
 def _targeted_delete_S_edges(G, n_delete, sensitive_heads):
-    """
-    Delete edges incident to S nodes to bring their degree
-    toward μ_NS. Stops when S degree reaches μ_NS.
-    """
     s_nodes  = [n for n in sensitive_heads if n in G.nodes()]
     ns_nodes = [n for n in G.nodes() if n not in sensitive_heads]
     if not s_nodes or not ns_nodes:
         return G, 0
-
-    mu_ns = float(np.median([G.degree(n) for n in ns_nodes]))
-
-    # Collect S edges sorted by node degree descending (greedily reduce densest S first)
-    s_edges = []
-    for u, v in G.edges():
-        if u in sensitive_heads or v in sensitive_heads:
-            s_edges.append((u, v))
+    mu_ns  = float(np.median([G.degree(n) for n in ns_nodes]))
+    s_edges = [(u, v) for u, v in G.edges()
+               if u in sensitive_heads or v in sensitive_heads]
     s_edges.sort(key=lambda e: max(G.degree(e[0]), G.degree(e[1])), reverse=True)
-
     deleted = 0
     for u, v in s_edges:
         if deleted >= n_delete:
             break
         if not G.has_edge(u, v):
             continue
-        # Only delete if the S endpoint is still above μ_NS
-        s_endpoint = u if u in sensitive_heads else v
-        if G.degree(s_endpoint) <= mu_ns:
+        s_ep = u if u in sensitive_heads else v
+        if G.degree(s_ep) <= mu_ns:
             continue
         G.remove_edge(u, v)
         deleted += 1
-
-    # Fallback if not enough
     if deleted < n_delete:
         G = _triangle_disruption_delete(G, n_delete - deleted, {})
-
     return G, deleted
 
 
 def _targeted_add_NS_edges(G, n_add, all_relations, sensitive_heads):
-    """
-    Add fake edges to NS nodes to bring their degree toward μ_S.
-    Stops adding to a node once it reaches μ_S.
-    """
     s_nodes  = [n for n in sensitive_heads if n in G.nodes()]
     ns_nodes = [n for n in G.nodes() if n not in sensitive_heads]
     if not ns_nodes:
         return G, 0
-
-    mu_s = float(np.median([G.degree(n) for n in s_nodes])) if s_nodes else 10.0
-
+    mu_s     = float(np.median([G.degree(n) for n in s_nodes])) if s_nodes else 10.0
+    ns_sorted = sorted(ns_nodes, key=lambda n: G.degree(n))
     added    = 0
     attempts = 0
-    # Prioritize NS nodes furthest below μ_S
-    ns_sorted = sorted(ns_nodes, key=lambda n: G.degree(n))
-
     while added < n_add and attempts < n_add * 100:
         attempts += 1
-        # Pick NS node that is still below μ_S
-        u = random.choice(ns_sorted[:max(1, len(ns_sorted)//2)])
+        u = random.choice(ns_sorted[:max(1, len(ns_sorted) // 2)])
         if G.degree(u) >= mu_s:
             continue
         v = random.choice(ns_nodes)
@@ -333,20 +293,14 @@ def _targeted_add_NS_edges(G, n_add, all_relations, sensitive_heads):
             continue
         G.add_edge(u, v, relations=[random.choice(all_relations)], fake=True)
         added += 1
-
     return G, added
 
-def prism_sanitize(outdir, budget, seed,
-                   G_orig, all_relations, sorted_edges, cn_cache,
-                   sensitive_heads=None):
-    """
-    PRISM = kg_defense_v2 — semi-targeted.
-    Deletes edges from S nodes, adds fake edges to NS nodes.
-    G_orig, all_relations, sorted_edges, cn_cache preloaded once outside loop.
-    """
+
+def sparse_sanitize(outdir, budget, seed,
+                    G_orig, all_relations, sorted_edges, cn_cache,
+                    sensitive_heads=None):
     bpct     = int(budget * 100)
-    out_path = os.path.join(outdir,
-                            f"kg_chameleon_prism_budget_{bpct:02d}pct.tsv")
+    out_path = os.path.join(outdir, f"kg_sanitized_budget_{bpct:02d}pct.tsv")
 
     random.seed(seed)
     np.random.seed(seed)
@@ -356,16 +310,14 @@ def prism_sanitize(outdir, budget, seed,
     n_budget = int(n_edges * budget)
     n_delete = int(n_budget * 0.50)
     n_rewire = int(n_budget * 0.20)
-    # Add back deleted edges + original add budget → preserve |E|
     n_add    = n_delete + (n_budget - n_delete - n_rewire)
 
-    print(f"  [PRISM] budget={budget:.0%} → "
-          f"delete={n_delete}, rewire={n_rewire}, add={n_add} "
-          f"(edge count preserved: {n_edges:,})")
+    print(f"  [Sparse] budget={budget:.0%} → "
+          f"delete={n_delete}, rewire={n_rewire}, add={n_add}")
 
     if sensitive_heads:
         G, deleted = _targeted_delete_S_edges(G, n_delete, sensitive_heads)
-        print(f"  [PRISM] Targeted delete: {deleted:,} S-incident edges removed")
+        print(f"  Targeted delete: {deleted:,} S-incident edges removed")
     else:
         G = _triangle_disruption_delete(G, n_delete, cn_cache.copy())
 
@@ -373,7 +325,7 @@ def prism_sanitize(outdir, budget, seed,
 
     if sensitive_heads:
         G, added = _targeted_add_NS_edges(G, n_add, all_relations, sensitive_heads)
-        print(f"  [PRISM] Targeted add: {added:,} fake edges on NS nodes")
+        print(f"  Targeted add: {added:,} fake edges on NS nodes")
     else:
         G = _add_plausible_fake_edges(G, n_add, all_relations)
 
@@ -381,15 +333,16 @@ def prism_sanitize(outdir, budget, seed,
 
     rows = []
     for u, v, data in G.edges(data=True):
-        for r in data.get("relations", ["unknown"]):
+        for r in data.get('relations', ['unknown']):
             rows.append([u, r, v])
-    pd.DataFrame(rows, columns=["h", "r", "t"]) \
-      .to_csv(out_path, sep="\t", index=False, header=False)
+    pd.DataFrame(rows, columns=['h', 'r', 't']) \
+      .to_csv(out_path, sep='\t', index=False, header=False)
     print(f"  [Save] {len(rows):,} triples → {out_path}")
     return out_path
 
 
-# 4. TFE v2 — (inverted profile)
+# ─────────────────────────────────────────────────────────────────
+# 4. DENSE BRANCH (feature distribution equalization)
 # ─────────────────────────────────────────────────────────────────
 
 def compute_features_nx(G):
@@ -455,13 +408,13 @@ def adjust_out_deg(G, node, target, all_rel, rng, np_rng, prefer_high=False):
             n_ops += 1
     elif cur < target:
         nodes = list(G.nodes())
-        cands = (sorted(nodes, key=lambda n: G.out_degree(n)+G.in_degree(n),
+        cands = (sorted(nodes, key=lambda n: G.out_degree(n) + G.in_degree(n),
                         reverse=True) if prefer_high else nodes)
         added, attempts = 0, 0
-        while added < target - cur and attempts < (target-cur) * 150:
+        while added < target - cur and attempts < (target - cur) * 150:
             attempts += 1
             if prefer_high and rng.random() < 0.7:
-                v = cands[rng.randint(0, min(100, len(cands)-1))]
+                v = cands[rng.randint(0, min(100, len(cands) - 1))]
             else:
                 nbs = list(G.successors(node))
                 if nbs:
@@ -473,8 +426,8 @@ def adjust_out_deg(G, node, target, all_rel, rng, np_rng, prefer_high=False):
             if v == node or G.has_edge(node, v):
                 continue
             G.add_edge(node, v, relation=rng.choice(all_rel), fake=True)
-            added += 1
-            n_ops += 1
+            added  += 1
+            n_ops  += 1
     return n_ops
 
 
@@ -490,7 +443,7 @@ def adjust_in_deg(G, node, target, all_rel, rng):
     elif cur < target:
         nodes = list(G.nodes())
         added, attempts = 0, 0
-        while added < target - cur and attempts < (target-cur) * 100:
+        while added < target - cur and attempts < (target - cur) * 100:
             attempts += 1
             u = rng.choice(nodes)
             if u == node or G.has_edge(u, node):
@@ -533,8 +486,11 @@ def find_ns_in_radius(features, ns_nodes, s_stats):
                    for f in ['out_deg', 'in_deg', 'rel_div'])]
 
 
-def tfe_sanitize(G_orig, sensitive_heads, budget, seed=42):
-    print(f"  [TFE v2] budget={budget:.0%}")
+def dense_sanitize(G_orig, sensitive_heads, budget, seed, outdir):
+    bpct     = int(budget * 100)
+    out_path = os.path.join(outdir, f"kg_sanitized_budget_{bpct:02d}pct.tsv")
+
+    print(f"  [Dense] budget={budget:.0%}")
     rng    = random.Random(seed)
     np_rng = np.random.RandomState(seed)
     G      = G_orig.copy()
@@ -546,18 +502,17 @@ def tfe_sanitize(G_orig, sensitive_heads, budget, seed=42):
     s_stats, ns_stats, ns_nodes, s_nodes = compute_distributions_nx(
         features, sensitive_heads, G)
 
-    # Phase 1: S → NS
     def disc(node):
         f = features.get(node, {})
         return sum(abs(f.get(ft, 0) - ns_stats[ft]['median'])
                    / (ns_stats[ft]['std'] + 1e-6)
                    for ft in ['out_deg', 'in_deg', 'rel_div', 'avg_nb_deg'])
 
-    s_sorted   = sorted(s_nodes, key=disc, reverse=True)
-    n_eq       = max(1, int(budget * len(s_sorted)))
-    total_ops  = 0
+    s_sorted  = sorted(s_nodes, key=disc, reverse=True)
+    n_eq      = max(1, int(budget * len(s_sorted)))
+    total_ops = 0
 
-    print(f"  [Phase 1] S→NS: {n_eq}/{len(s_nodes)} nodes")
+    print(f"  [Phase 1] S→NS equalization: {n_eq}/{len(s_nodes)} nodes")
     for node in s_sorted[:n_eq]:
         total_ops += adjust_out_deg(G, node,
                          sample_lognormal(ns_stats, 'out_deg', np_rng),
@@ -569,13 +524,12 @@ def tfe_sanitize(G_orig, sensitive_heads, budget, seed=42):
                          sample_lognormal(ns_stats, 'rel_div', np_rng),
                          all_rel, rng)
 
-    # Phase 2: NS → S aggressive
     features = compute_features_nx(G)
     s_stats, ns_stats, ns_nodes, s_nodes = compute_distributions_nx(
         features, sensitive_heads, G)
     ns_in_r = find_ns_in_radius(features, ns_nodes, s_stats)
 
-    print(f"  [Phase 2] NS→S: {len(ns_in_r):,}/{len(ns_nodes):,} nodes")
+    print(f"  [Phase 2] NS boundary confusion: {len(ns_in_r):,}/{len(ns_nodes):,} nodes")
     for node in ns_in_r:
         total_ops += adjust_out_deg(G, node,
                          sample_lognormal(s_stats, 'out_deg', np_rng),
@@ -587,9 +541,12 @@ def tfe_sanitize(G_orig, sensitive_heads, budget, seed=42):
                          sample_lognormal(s_stats, 'rel_div', np_rng),
                          all_rel, rng)
 
-    print(f"  [TFE v2] Total ops: {total_ops:,} | "
+    print(f"  Total ops: {total_ops:,} | "
           f"{G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
-    return G
+
+    save_graph_nx(G, out_path)
+    return out_path
+
 
 # ─────────────────────────────────────────────────────────────────
 # 5. MAIN
@@ -597,13 +554,13 @@ def tfe_sanitize(G_orig, sensitive_heads, budget, seed=42):
 
 def main():
     parser = argparse.ArgumentParser(description='CHAMELEON — Dynamic Defense')
-    parser.add_argument('--public-path',  required=True)
-    parser.add_argument('--sens-dir',     required=True)
-    parser.add_argument('--outdir',       required=True)
-    parser.add_argument('--budgets',      nargs='+', type=float,
+    parser.add_argument('--public-path', required=True)
+    parser.add_argument('--sens-dir',    required=True)
+    parser.add_argument('--outdir',      required=True)
+    parser.add_argument('--budgets',     nargs='+', type=float,
                         default=[0.05, 0.10, 0.20, 0.30, 0.40,
                                  0.50, 0.60, 0.70, 0.80, 0.90])
-    parser.add_argument('--seed',         type=int,   default=42)
+    parser.add_argument('--seed',        type=int, default=42)
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -620,28 +577,25 @@ def main():
 
     print("\n[+] Loading graph...")
     G_nx = load_graph_nx(args.public_path)
-    print(f"    Nodes: {G_nx.number_of_nodes():,}  "
-          f"Edges: {G_nx.number_of_edges():,}")
+    print(f"    Nodes: {G_nx.number_of_nodes():,}  Edges: {G_nx.number_of_edges():,}")
 
     print("\n[+] Loading sensitive heads...")
     sensitive_heads = load_all_sensitive_heads(args.sens_dir)
 
-    # ── PROFILE DETECTION ────────────────────────────────────────
-    profile      = detect_profile(G_nx, sensitive_heads)
-    defense_name = "TFE v2" if profile == 'inverted' else "PRISM"
+    # ── PROFILE DETECTION (done once) ────────────────────────────
+    profile = detect_profile(G_nx, sensitive_heads)
 
     print(f"\n{'─'*60}")
-    print(f"  Selected defense : {defense_name}")
+    print(f"  Profile : {'dense' if profile == 'inverted' else 'sparse'}")
     print(f"{'─'*60}")
 
-    # ── PRE-LOAD ONCE FOR PRISM (avoid reloading per budget) ─────
+    # ── PRE-LOAD for sparse branch (done once, not per budget) ───
     if profile == 'normal':
-        print("\n[+] Pre-loading graph data for PRISM (done once)...")
-        G_prism, all_relations_p = _load_kg_prism(args.public_path)
-        sorted_edges_p, cn_cache_p = _compute_risk_scores(G_prism)
-        print(f"    Preload done — {G_prism.number_of_nodes():,} nodes, "
-              f"{G_prism.number_of_edges():,} edges, "
-              f"{len(cn_cache_p):,} risk scores")
+        print("\n[+] Pre-loading undirected graph for sparse branch...")
+        G_und, all_relations_u = load_graph_undirected(args.public_path)
+        sorted_edges_u, cn_cache_u = _compute_risk_scores(G_und)
+        print(f"    Done — {G_und.number_of_nodes():,} nodes, "
+              f"{G_und.number_of_edges():,} edges")
 
     # ── RUN PER BUDGET ───────────────────────────────────────────
     for budget in args.budgets:
@@ -649,26 +603,21 @@ def main():
         print(f"  Budget = {budget:.0%}")
 
         if profile == 'inverted':
-            G_san    = tfe_sanitize(G_nx, sensitive_heads,
-                                    budget=budget, seed=args.seed)
-            bpct     = int(budget * 100)
-            out_path = os.path.join(args.outdir,
-                                    f"kg_chameleon_tfe_budget_{bpct:02d}pct.tsv")
-            save_graph_nx(G_san, out_path)
+            dense_sanitize(G_nx, sensitive_heads, budget, args.seed, args.outdir)
         else:
-            prism_sanitize(
+            sparse_sanitize(
                 outdir          = args.outdir,
                 budget          = budget,
                 seed            = args.seed,
-                G_orig          = G_prism,
-                all_relations   = all_relations_p,
-                sorted_edges    = sorted_edges_p,
-                cn_cache        = cn_cache_p,
+                G_orig          = G_und,
+                all_relations   = all_relations_u,
+                sorted_edges    = sorted_edges_u,
+                cn_cache        = cn_cache_u,
                 sensitive_heads = sensitive_heads,
             )
 
     print(f"\n{'='*60}")
-    print(f"  CHAMELEON Done — Defense used: {defense_name}")
+    print(f"  CHAMELEON Done")
     print(f"  Output: {args.outdir}")
     print(f"{'='*60}\n")
 

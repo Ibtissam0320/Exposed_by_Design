@@ -1,13 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-ATTACK 2 (PAIRWISE) driven by Attack1-head + Attack1-tail.
-
-Adds:
-  - feature-set: local / proxies / knn
-  - kNN structural context is applied to HEAD features only (like your previous Attack2)
-"""
 
 import argparse
 import json
