@@ -15,7 +15,7 @@
 
 ---
 
-## Splitting Public / Sensitive Triples
+## Splitting Public / private graph
 
 A script `split.py` is provided to split the raw KG into a public graph and sensitive files (one per relation):
 
