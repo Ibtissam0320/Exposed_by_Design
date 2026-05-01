@@ -1,4 +1,4 @@
-# Data
+# Knowledge graphs
 
 ## Download
 
