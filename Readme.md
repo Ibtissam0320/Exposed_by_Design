@@ -84,9 +84,27 @@ To reproduce the results of the paper, follow these steps:
 2. Run the undefended attack experiments:
 
 ```bash
-bash experiments/runner1.sh   # Attack 1
-bash experiments/runner2.sh   # Attack 2
-bash experiments/runner3.sh   # Attack 3
+python attacks/attack1_head.py \
+  --public-path ./nell_out/public.tsv \
+  --sens-path ./nell_out/concept:teamplaysagainstteam.tsv \
+  --outdir ./results/attack1/ \
+  --seed 42    # Attack 1
+python attack2_pairwise.py \
+  --public-path data/public.tsv \
+  --sens-path data/sensitive.tsv \
+  --attack1-head-scores results/attack1_heads_scores.tsv \
+  --attack1-tail-scores results/attack1_tails_scores.tsv \
+  --outdir results_attack2/   # Attack 2
+python attack3_knn_reconstruction.py \
+  --public_tsv data/public.tsv \
+  --sensitive_dir data/sensitive \
+  --sensitive_files has_age_category.tsv \
+  --outdir results_attack3 \
+  --seed_frac 0.2 \
+  --knn_k 120 \
+  --max_pred_per_head 3 \
+  --vote_threshold 0.0 \
+  --hash_dim_out 256 \    # Attack 3
 ```
 
 3. Apply the defense mechanisms:
@@ -119,8 +137,8 @@ bash experiments/runner3.sh   # Attack 3 ablation
 
 The main results of the paper are organized as follows:
 
-- **Attack 1 — Head Existence Prediction:** Predicts whether a node participates in a sensitive relation using topological features from the public graph.
-- **Attack 2 — Tail Entity Inference:** Given a confirmed sensitive head entity, infers the most likely tail entity for the target relation.
+- **Attack 1 — Link Inference:** Predicts whether a head vertex is involoved in a target relation using topological features from the public graph.
+- **Attack 2 — Triple Inference:** Given a confirmed target head entity, infers the most likely tail entity for the target relation.
 - **Attack 3 — Link Prediction via Structural Propagation:** Predicts sensitive triples by propagating labels from a seed set using k-nearest neighbor similarity over structural feature vectors.
 
 Each attack is associated with:
