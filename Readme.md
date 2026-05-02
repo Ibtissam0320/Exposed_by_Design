@@ -74,7 +74,7 @@ Refer to `dataprocessing/README.md` for the full list of sensitive relations use
 To reproduce the results of the paper, follow these steps:
 
 1. Prepare the data as described above.
-2. Navigate to the `experiments/` directory and run the appropriate runner script for each attack.
+2. Navigate to the `attacks/` directory and run the appropriate script for each attack.
 3. To apply defenses, run the corresponding scripts in the `defenses/` directory.
 4. After execution, results are saved in the `results/` directory.
 
