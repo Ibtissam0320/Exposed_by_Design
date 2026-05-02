@@ -43,7 +43,7 @@ We have also tested the code on a smaller CPU-only setup:
 - 4-core CPU
 - Any OS with Python 3.7+
 
-**Note:** Experiments on NELL can be run on CPU in approximately 1–2 hours. GPU acceleration is recommended for FB15k-237 and HealthKG.
+**Note:** Experiments on NELL and FB15K-237 can be run on CPU in approximately 1–2 hours. GPU acceleration is recommended for HealthKG.
 
 ---
 
